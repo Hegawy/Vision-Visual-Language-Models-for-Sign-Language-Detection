@@ -1,49 +1,80 @@
 import os
 import torch
+import pandas as pd
+import numpy as np
 from PIL import Image
+from torchvision import transforms
 from tqdm import tqdm
 import open_clip
-from torchvision import transforms
 
-# --- Paths ---
-input_dir = "wlasl_phase1_crops_upper"
-output_dir = "wlasl_clip_timesformer_features_openclip"
-os.makedirs(output_dir, exist_ok=True)
+# === SETTINGS ===
+ANNOTATIONS_FILE = "PHOENIX-2014-T/annotations/manual/subsets/train_sentence_subset.csv"
+FRAME_ROOT_DIR = "PHOENIX-2014-T/features/fullFrame-210x260px/train_top50"
+FEATURES_OUT_DIR = "PHOENIX-2014-T/features_clip_sla"
+FRAMES_PER_VIDEO = 16
+DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+CLIP_MODEL_NAME = "ViT-B-32"
+CLIP_PRETRAINED = "openai"
 
-# --- Device ---
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-print(f"Using device: {device}")
+# === STEP 1: Load annotations and create label map ===
+df = pd.read_csv(ANNOTATIONS_FILE, delimiter='|', header=None)
+df.columns = ['name', 'video', 'start', 'end', 'speaker', 'orth', 'translation']
+df = df[['name', 'orth']]
 
-# --- Load CLIP Model ---
-model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
-model = model.to(device)
-model.eval()
+label_map = {s: i for i, s in enumerate(df['orth'].unique())}
 
-# --- Traverse Labels ---
-for label in tqdm(os.listdir(input_dir), desc="Processing labels"):
-    label_path = os.path.join(input_dir, label)
-    output_label_path = os.path.join(output_dir, label)
-    os.makedirs(output_label_path, exist_ok=True)
+# === STEP 2: Load CLIP model ===
+model, _, preprocess = open_clip.create_model_and_transforms(CLIP_MODEL_NAME, pretrained=CLIP_PRETRAINED)
+model = model.to(DEVICE).eval()
 
-    # Group frames by video_id prefix
-    video_frames = {}
-    for fname in sorted(os.listdir(label_path)):
-        if not fname.endswith(('.jpg', '.png')):
+# === STEP 3: Create output directory ===
+os.makedirs(FEATURES_OUT_DIR, exist_ok=True)
+
+# === STEP 4: Process each video ===
+results = []
+
+for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting CLIP features"):
+    name = row['name']
+    sentence = row['orth']
+    label = label_map[sentence]
+    video_dir = os.path.join(FRAME_ROOT_DIR, name)
+
+    if not os.path.exists(video_dir):
+        continue
+
+    frame_files = sorted([f for f in os.listdir(video_dir) if f.endswith('.png')])
+    if len(frame_files) < FRAMES_PER_VIDEO:
+        continue
+
+    indices = np.linspace(0, len(frame_files) - 1, FRAMES_PER_VIDEO).astype(int)
+    images = []
+    for idx in indices:
+        try:
+            frame = Image.open(os.path.join(video_dir, frame_files[idx])).convert("RGB")
+            images.append(preprocess(frame))
+        except:
             continue
-        vid = "_".join(fname.split("_")[:-1])  # remove _f0, _f1...
-        video_frames.setdefault(vid, []).append(os.path.join(label_path, fname))
 
-    # Process each video
-    for vid, frame_paths in video_frames.items():
-        features = []
+    if len(images) != FRAMES_PER_VIDEO:
+        continue
 
-        for frame_path in frame_paths:
-            image = Image.open(frame_path).convert("RGB")
-            image_tensor = preprocess(image).unsqueeze(0).to(device)
+    batch = torch.stack(images).to(DEVICE)
+    with torch.no_grad():
+        features = model.encode_image(batch)  # shape: [T, 512 or 768]
 
-            with torch.no_grad():
-                embedding = model.encode_image(image_tensor).squeeze(0).cpu()
-            features.append(embedding)
+    save_path = os.path.join(FEATURES_OUT_DIR, f"{name}.pt")
+    torch.save({
+        "clip_features": features.cpu(),
+        "label": label,
+        "text": sentence
+    }, save_path)
 
-        features_tensor = torch.stack(features)  # shape: [T, D]
-        torch.save(features_tensor, os.path.join(output_label_path, f"{vid}.pt"))
+    results.append((name, label, sentence))
+
+# === Save metadata and label map ===
+pd.DataFrame(results, columns=["name", "label", "text"]).to_csv(os.path.join(FEATURES_OUT_DIR, "metadata.csv"), index=False)
+with open(os.path.join(FEATURES_OUT_DIR, "label_map.txt"), "w") as f:
+    for text, idx in label_map.items():
+        f.write(f"{idx}\t{text}\n")
+
+print(f"✅ Saved {len(results)} feature files in: {FEATURES_OUT_DIR}")
